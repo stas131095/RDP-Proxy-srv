@@ -60,7 +60,7 @@ jobs:
           if (-not $tsIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Install and Configure 3proxy
+      - name: Install and Configure 3proxy as Service
         run: |
           $proxyDir = "C:\3proxy"
           New-Item -Path $proxyDir -ItemType Directory -Force | Out-Null
@@ -79,9 +79,8 @@ jobs:
 
           Write-Host "Proxy credentials: User=$proxyUser Pass=$proxyPass"
 
-          # Use string formatting - binds to ALL interfaces (0.0.0.0)
+          # Create config file
           $usersLine = "users {0}:CL:{1}" -f $proxyUser, $proxyPass
-          
           $cfgPath = "$proxyDir\3proxy.cfg"
           $configLines = @(
               "nserver 8.8.8.8",
@@ -97,95 +96,74 @@ jobs:
               "allow *",
               "deny * * *"
           )
-
           $configLines | Set-Content -Path $cfgPath -Encoding ASCII
           
           Write-Host "Config file created:"
           Get-Content $cfgPath
 
-          $proc = Start-Process -FilePath "$proxyDir\bin\3proxy.exe" -ArgumentList $cfgPath -PassThru -NoNewWindow
-          Write-Host "3proxy started with PID: $($proc.Id)"
+          # Remove existing service if present
+          & "$proxyDir\bin\3proxy.exe" --remove 2>$null
 
+          # Install as Windows service
+          $installResult = & "$proxyDir\bin\3proxy.exe" --install $cfgPath 2>&1
+          Write-Host "Service install result: $installResult"
+
+          # Start the service
+          Start-Service -Name "3proxy" -ErrorAction Stop
+          Write-Host "3proxy service started"
+
+          # Wait for service to be fully running
           Start-Sleep -Seconds 5
-          
-          $socksReady = $false
-          for ($i = 0; $i -lt 6; $i++) {
-              $conn = Get-NetTCPConnection -LocalPort 1080 -ErrorAction SilentlyContinue
-              if ($conn) {
-                  $socksReady = $true
-                  Write-Host "SOCKS port 1080 is listening on $($conn.LocalAddress)"
-                  break
-              }
-              $procCheck = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
-              if (-not $procCheck) {
-                  Write-Host "3proxy process died!"
-                  break
-              }
-              Write-Host "Waiting for port 1080... attempt $($i + 1)"
-              Start-Sleep -Seconds 2
-          }
 
-          if (-not $socksReady) {
-              Write-Error "SOCKS proxy port 1080 not listening"
+          # Verify service is running
+          $service = Get-Service -Name "3proxy"
+          Write-Host "Service status: $($service.Status)"
+
+          # Verify ports are listening
+          Write-Host "Checking listening ports..."
+          $socksPort = Get-NetTCPConnection -LocalPort 1080 -ErrorAction SilentlyContinue
+          $httpPort = Get-NetTCPConnection -LocalPort 3128 -ErrorAction SilentlyContinue
+          
+          if ($socksPort) {
+              Write-Host "SOCKS port 1080 is listening on $($socksPort.LocalAddress)"
+          } else {
+              Write-Error "SOCKS port 1080 not listening"
               exit 1
           }
 
-          # Show listening addresses
-          Write-Host "Listening connections:"
-          Get-NetTCPConnection -LocalPort 1080,3128 | Select-Object LocalAddress, LocalPort, State
+          if ($httpPort) {
+              Write-Host "HTTP port 3128 is listening on $($httpPort.LocalAddress)"
+          } else {
+              Write-Error "HTTP port 3128 not listening"
+              exit 1
+          }
 
           echo "PROXY_USERNAME=$proxyUser" >> $env:GITHUB_ENV
           echo "PROXY_PASSWORD=$proxyPass" >> $env:GITHUB_ENV
           echo "PROXY_SOCKS_PORT=1080" >> $env:GITHUB_ENV
           echo "PROXY_HTTP_PORT=3128" >> $env:GITHUB_ENV
           echo "PROXY_AUTH_ENABLED=true" >> $env:GITHUB_ENV
-          Write-Host "3proxy started successfully"
+          Write-Host "3proxy service running successfully"
 
       - name: Verify RDP and Proxy Accessibility
         run: |
           Write-Host "Testing connectivity via Tailscale IP: $env:TAILSCALE_IP"
           
-          # Show current listening state
-          Write-Host "Current listening state:"
-          Get-NetTCPConnection -LocalPort 1080,3128,3389 | Select-Object LocalAddress, LocalPort, State, OwningProcess
+          Write-Host "Service status:"
+          Get-Service -Name "3proxy" | Select-Object Name, Status, StartType
           
-          # Test RDP
-          $rdpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          Write-Host "Listening ports:"
+          Get-NetTCPConnection -LocalPort 1080,3128,3389 -ErrorAction SilentlyContinue | Select-Object LocalAddress, LocalPort, State
+          
+          $rdpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue -TcpTestTimeOut 5000
           if (-not $rdpTest.TcpTestSucceeded) { Write-Error "RDP port 3389 unreachable"; exit 1 }
           Write-Host "RDP: OK"
           
-          # Test SOCKS proxy with explicit timeout
-          Write-Host "Testing SOCKS proxy..."
           $socksTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 1080 -WarningAction SilentlyContinue -TcpTestTimeOut 5000
-          if (-not $socksTest.TcpTestSucceeded) {
-              Write-Host "SOCKS test failed. Checking firewall..."
-              netsh advfirewall firewall show rule name="Proxy-SOCKS-Tailscale"
-              Write-Error "SOCKS proxy port 1080 unreachable"
-              exit 1
-          }
-          Write-Host "SOCKS5 Proxy: OK"
-          
-          # Test HTTP proxy
-          Write-Host "Testing HTTP proxy..."
-          $httpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3128 -WarningAction SilentlyContinue -TcpTestTimeOut 5000
-          if (-not $httpTest.TcpTestSucceeded) {
-              Write-Host "HTTP test failed. Checking firewall..."
-              netsh advfirewall firewall show rule name="Proxy-HTTP-Tailscale"
-              Write-Error "HTTP proxy port 3128 unreachable"
-              exit 1
-          }
-          Write-Host "HTTP Proxy: OK"
-
-      - name: Verify RDP and Proxy Accessibility
-        run: |
-          Write-Host "Testing connectivity via Tailscale IP: $env:TAILSCALE_IP"
-          $rdpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-          if (-not $rdpTest.TcpTestSucceeded) { Write-Error "RDP port 3389 unreachable"; exit 1 }
-          Write-Host "RDP: OK"
-          $socksTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 1080 -WarningAction SilentlyContinue
           if (-not $socksTest.TcpTestSucceeded) { Write-Error "SOCKS proxy port 1080 unreachable"; exit 1 }
           Write-Host "SOCKS5 Proxy: OK"
-          $httpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3128 -WarningAction SilentlyContinue
+          
+          $httpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3128 -WarningAction SilentlyContinue -TcpTestTimeOut 5000
           if (-not $httpTest.TcpTestSucceeded) { Write-Error "HTTP proxy port 3128 unreachable"; exit 1 }
           Write-Host "HTTP Proxy: OK"
 
@@ -210,6 +188,11 @@ jobs:
         run: |
           Write-Host "Keeping runner active..."
           while ($true) {
+              $service = Get-Service -Name "3proxy" -ErrorAction SilentlyContinue
+              if ($service -and $service.Status -ne 'Running') {
+                  Write-Warning "3proxy service not running, restarting..."
+                  Start-Service -Name "3proxy"
+              }
               Write-Host "[$(Get-Date)] Session active — IP: $env:TAILSCALE_IP"
               Start-Sleep -Seconds 300
           }
