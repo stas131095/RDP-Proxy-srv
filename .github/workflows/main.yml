@@ -67,34 +67,22 @@ jobs:
           New-Item -Path $proxyDir -ItemType Directory -Force | Out-Null
           New-Item -Path $logDir -ItemType Directory -Force | Out-Null
 
+          # Download 3proxy
           $proxyUrl = "https://github.com/z3APA3A/3proxy/releases/download/0.9.4/3proxy-0.9.4.zip"
           $zipPath = "$env:TEMP\3proxy.zip"
           Invoke-WebRequest -Uri $proxyUrl -OutFile $zipPath
           Expand-Archive -Path $zipPath -DestinationPath "$proxyDir\src" -Force
           Remove-Item $zipPath -Force
           
+          # Copy binaries
           New-Item -Path "$proxyDir\bin" -ItemType Directory -Force | Out-Null
           Copy-Item "$proxyDir\src\bin\*.*" -Destination "$proxyDir\bin\" -Force
 
+          # Generate credentials
           $proxyUser = "proxyuser"
           $proxyPass = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 12 | ForEach-Object {[char]$_})
-          
-          $hashOutput = & "$proxyDir\bin\3proxy.exe" "--hash=$proxyPass" 2>&1
-          $authHash = ""
-          foreach ($line in $hashOutput) {
-              if ($line -match ":") {
-                  $authHash = ($line -split ":", 2)[1].Trim()
-                  break
-              }
-          }
-          
-          $usePlaintext = $false
-          if (-not $authHash) {
-              Write-Warning "Hash generation failed, using plaintext auth"
-              $usePlaintext = $true
-          }
 
-          # Write config file line by line to avoid encoding issues
+          # Create config file (using plaintext auth for reliability)
           $cfgPath = "$proxyDir\3proxy.cfg"
           $configLines = @(
               "daemon",
@@ -103,23 +91,17 @@ jobs:
               "nserver 8.8.4.4",
               "nscache 65536",
               "timeouts 1 5 30 60 180 1800 15 60",
-              "socks -p1080"
+              "socks -p1080",
+              "auth strong",
+              "users $proxyUser:CL:$proxyPass",
+              "proxy -p3128",
+              "auth strong",
+              "users $proxyUser:CL:$proxyPass",
+              "allow * $proxyUser *",
+              "deny * * *"
           )
-          
-          if ($usePlaintext) {
-              $configLines += "auth none"
-              $configLines += "allow * * *"
-          } else {
-              $configLines += "auth strong"
-              $configLines += "users $proxyUser:CL:$authHash"
-              $configLines += "proxy -p3128"
-              $configLines += "auth strong"
-              $configLines += "users $proxyUser:CL:$authHash"
-              $configLines += "allow * $proxyUser *"
-              $configLines += "deny * * *"
-          }
 
-          # Write with ASCII encoding (3proxy requirement)
+          # Write with ASCII encoding (critical for 3proxy)
           $configLines | Set-Content -Path $cfgPath -Encoding ASCII
           
           Write-Host "Config file created:"
@@ -132,6 +114,7 @@ jobs:
           # Wait and verify
           Start-Sleep -Seconds 5
           
+          $socksReady = $false
           for ($i = 0; $i -lt 6; $i++) {
               $socksReady = (Get-NetTCPConnection -LocalPort 1080 -ErrorAction SilentlyContinue) -ne $null
               if ($socksReady) {
@@ -145,8 +128,6 @@ jobs:
           if (-not $socksReady) {
               Write-Host "3proxy process status:"
               Get-Process -Id $proc.Id -ErrorAction SilentlyContinue | Format-List *
-              Write-Host "Config file content:"
-              Get-Content $cfgPath
               Write-Host "Log file content:"
               if (Test-Path "$logDir\3proxy.log") { Get-Content "$logDir\3proxy.log" -Tail 20 }
               Write-Error "SOCKS proxy port 1080 not listening"
@@ -157,7 +138,7 @@ jobs:
           echo "PROXY_PASSWORD=$proxyPass" >> $env:GITHUB_ENV
           echo "PROXY_SOCKS_PORT=1080" >> $env:GITHUB_ENV
           echo "PROXY_HTTP_PORT=3128" >> $env:GITHUB_ENV
-          echo "PROXY_AUTH_ENABLED=$(!$usePlaintext)" >> $env:GITHUB_ENV
+          echo "PROXY_AUTH_ENABLED=true" >> $env:GITHUB_ENV
           Write-Host "3proxy started successfully"
 
       - name: Verify RDP and Proxy Accessibility
@@ -169,11 +150,9 @@ jobs:
           $socksTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 1080 -WarningAction SilentlyContinue
           if (-not $socksTest.TcpTestSucceeded) { Write-Error "SOCKS proxy port 1080 unreachable"; exit 1 }
           Write-Host "SOCKS5 Proxy: OK"
-          if ($env:PROXY_AUTH_ENABLED -eq 'true') {
-              $httpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3128 -WarningAction SilentlyContinue
-              if (-not $httpTest.TcpTestSucceeded) { Write-Error "HTTP proxy port 3128 unreachable"; exit 1 }
-              Write-Host "HTTP Proxy: OK"
-          }
+          $httpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3128 -WarningAction SilentlyContinue
+          if (-not $httpTest.TcpTestSucceeded) { Write-Error "HTTP proxy port 3128 unreachable"; exit 1 }
+          Write-Host "HTTP Proxy: OK"
 
       - name: Output Connection Details
         run: |
@@ -184,10 +163,12 @@ jobs:
           Write-Host "  Password: $env:RDP_PASSWORD"
           Write-Host "`nProxy Credentials:"
           Write-Host "  SOCKS5: $env:TAILSCALE_IP:$env:PROXY_SOCKS_PORT"
+          Write-Host "  HTTP/S: $env:TAILSCALE_IP:$env:PROXY_HTTP_PORT"
           Write-Host "  Username: $env:PROXY_USERNAME"
           Write-Host "  Password: $env:PROXY_PASSWORD"
           Write-Host "`nUsage:"
           Write-Host "  curl --proxy socks5h://$env:PROXY_USERNAME:$env:PROXY_PASSWORD@$env:TAILSCALE_IP:$env:PROXY_SOCKS_PORT https://api.ipify.org"
+          Write-Host "  curl --proxy http://$env:PROXY_USERNAME:$env:PROXY_PASSWORD@$env:TAILSCALE_IP:$env:PROXY_HTTP_PORT https://api.ipify.org"
           Write-Host "  RDP: mstsc /v:$env:TAILSCALE_IP"
 
       - name: Maintain Connection
