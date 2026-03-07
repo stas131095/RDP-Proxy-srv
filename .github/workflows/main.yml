@@ -114,63 +114,123 @@ jobs:
           # Create proxy directory
           $proxyDir = "C:\3proxy"
           New-Item -Path $proxyDir -ItemType Directory -Force | Out-Null
+          $logDir = "$proxyDir\logs"
+          New-Item -Path $logDir -ItemType Directory -Force | Out-Null
 
           # Download 3proxy (latest stable Windows build)
           $proxyUrl = "https://github.com/z3APA3A/3proxy/releases/download/0.9.4/3proxy-0.9.4.zip"
           $zipPath = "$env:TEMP\3proxy.zip"
           Invoke-WebRequest -Uri $proxyUrl -OutFile $zipPath
-          Expand-Archive -Path $zipPath -DestinationPath $proxyDir -Force
+          Expand-Archive -Path $zipPath -DestinationPath "$proxyDir\src" -Force
           Remove-Item $zipPath -Force
 
-          # Generate proxy auth credentials (optional, comment out to disable auth)
+          # Copy binaries to bin folder for cleaner structure
+          New-Item -Path "$proxyDir\bin" -ItemType Directory -Force | Out-Null
+          Copy-Item "$proxyDir\src\bin\*.*" -Destination "$proxyDir\bin\" -Force
+
+          # Generate proxy auth credentials
           $proxyUser = "proxyuser"
           $proxyPass = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 12 | ForEach-Object {[char]$_})
-          $authHash = & "$proxyDir\bin\3proxy.exe" --hash=$proxyPass
           
-          # Create 3proxy configuration file
-          $config = @"
-          daemon
-          nserver 8.8.8.8
-          nserver 8.8.4.4
-          nscache 65536
-          timeouts 1 5 30 60 180 1800 15 60
-          setgid 0
-          setuid 0
+          # Generate password hash using 3proxy's built-in tool
+          $hashOutput = & "$proxyDir\bin\3proxy.exe" "--hash=$proxyPass" 2>&1 | Out-String
+          $authHash = ($hashOutput -split ":")[1].Trim()
+          
+          if (-not $authHash) {
+              Write-Warning "⚠️ Could not generate hash, falling back to plaintext auth (less secure)"
+              $usePlaintext = $true
+          } else {
+              $usePlaintext = $false
+          }
 
-          # SOCKS5 proxy on port 1080
-          socks -p1080
-          auth strong
-          users $proxyUser:CL:$authHash
+          # Create 3proxy configuration file (MUST be ANSI encoding)
+          $configPath = "$proxyDir\3proxy.cfg"
+          $configContent = @"
+  daemon
+  log "$logDir\3proxy.log" D
+  nserver 8.8.8.8
+  nserver 8.8.4.4
+  nscache 65536
+  timeouts 1 5 30 60 180 1800 15 60
 
-          # HTTP/HTTPS proxy on port 3128
-          proxy -p3128
-          auth strong
-          users $proxyUser:CL:$authHash
+  # SOCKS5 proxy on port 1080
+  socks -p1080
+  "@
+          if ($usePlaintext) {
+              $configContent += "`nauth none`nallow * * *`n"
+          } else {
+              $configContent += @"
 
-          allow * $proxyUser *
-          deny * * *
-          "@
-          $config | Out-File -FilePath "$proxyDir\3proxy.cfg" -Encoding ASCII
+  auth strong
+  users $proxyUser:CL:$authHash
 
-          # Start 3proxy as a background process
-          Start-Process -FilePath "$proxyDir\bin\3proxy.exe" -ArgumentList "--run", "$proxyDir\3proxy.cfg" -NoNewWindow -PassThru
+  # HTTP/HTTPS proxy on port 3128
+  proxy -p3128
+  auth strong
+  users $proxyUser:CL:$authHash
 
+  allow * $proxyUser *
+  deny * * *
+  "@
+          }
+
+          # Write config with ANSI encoding (critical for 3proxy on Windows)
+          [System.IO.File]::WriteAllText($configPath, $configContent, [System.Text.Encoding]::Default)
+
+          # Start 3proxy in background (no --run flag, just config path)
+          $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+          $startInfo.FileName = "$proxyDir\bin\3proxy.exe"
+          $startInfo.Arguments = "`"$configPath`""
+          $startInfo.WorkingDirectory = $proxyDir
+          $startInfo.UseShellExecute = $false
+          $startInfo.CreateNoWindow = $true
+          $proc = [System.Diagnostics.Process]::Start($startInfo)
+          
+          Write-Host "🔄 3proxy started with PID: $($proc.Id)"
+
+          # Wait for ports to bind
+          Start-Sleep -Seconds 5
+          
+          # Verify proxy is listening
+          $maxRetries = 6
+          $retryCount = 0
+          $socksReady = $false
+          $httpReady = $false
+          
+          while ($retryCount -lt $maxRetries) {
+              $socksReady = (Get-NetTCPConnection -LocalPort 1080 -ErrorAction SilentlyContinue) -ne $null
+              $httpReady = (Get-NetTCPConnection -LocalPort 3128 -ErrorAction SilentlyContinue) -ne $null
+              
+              if ($socksReady -and ($usePlaintext -or $httpReady)) { break }
+              
+              Start-Sleep -Seconds 2
+              $retryCount++
+          }
+          
+          if (-not $socksReady) {
+              Write-Error "❌ SOCKS proxy port 1080 not listening"
+              if (Test-Path "$logDir\3proxy.log") {
+                  Write-Host "📄 Last 10 log lines:"
+                  Get-Content "$logDir\3proxy.log" -Tail 10 -ErrorAction SilentlyContinue
+              }
+              exit 1
+          }
+          if (-not $usePlaintext -and -not $httpReady) {
+              Write-Error "❌ HTTP proxy port 3128 not listening"
+              exit 1
+          }
+          
           # Save proxy credentials to environment
           echo "PROXY_USERNAME=$proxyUser" >> $env:GITHUB_ENV
           echo "PROXY_PASSWORD=$proxyPass" >> $env:GITHUB_ENV
           echo "PROXY_SOCKS_PORT=1080" >> $env:GITHUB_ENV
           echo "PROXY_HTTP_PORT=3128" >> $env:GITHUB_ENV
-
-          # Verify proxy is listening
-          Start-Sleep -Seconds 3
-          $socksListener = Get-NetTCPConnection -LocalPort 1080 -ErrorAction SilentlyContinue
-          $httpListener = Get-NetTCPConnection -LocalPort 3128 -ErrorAction SilentlyContinue
+          echo "PROXY_AUTH_ENABLED=$(!$usePlaintext)" >> $env:GITHUB_ENV
           
-          if (-not $socksListener -or -not $httpListener) {
-              Write-Error "❌ Proxy failed to start on expected ports"
-              exit 1
-          }
           Write-Host "✅ 3proxy started successfully (SOCKS5:1080, HTTP:3128)"
+          if ($usePlaintext) {
+              Write-Warning "⚠️ Running with plaintext auth (password hash generation failed)"
+          }
 
       - name: Verify RDP and Proxy Accessibility
         run: |
@@ -192,13 +252,17 @@ jobs:
           }
           Write-Host "✅ SOCKS5 Proxy: OK"
 
-          # Test HTTP proxy
-          $httpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3128 -WarningAction SilentlyContinue
-          if (-not $httpTest.TcpTestSucceeded) {
-              Write-Error "❌ HTTP proxy port 3128 unreachable"
-              exit 1
+          # Test HTTP proxy (only if auth is enabled)
+          if ($env:PROXY_AUTH_ENABLED -eq 'true') {
+              $httpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3128 -WarningAction SilentlyContinue
+              if (-not $httpTest.TcpTestSucceeded) {
+                  Write-Error "❌ HTTP proxy port 3128 unreachable"
+                  exit 1
+              }
+              Write-Host "✅ HTTP Proxy: OK"
+          } else {
+              Write-Host "⚠️ HTTP proxy skipped (plaintext auth mode)"
           }
-          Write-Host "✅ HTTP Proxy: OK"
 
       - name: Output Connection Details
         run: |
@@ -211,13 +275,17 @@ jobs:
           
           Write-Host "`n🌐 Proxy Credentials:" -ForegroundColor Yellow
           Write-Host "  SOCKS5:  $env:TAILSCALE_IP`:$env:PROXY_SOCKS_PORT" -ForegroundColor Green
-          Write-Host "  HTTP/S:  $env:TAILSCALE_IP`:$env:PROXY_HTTP_PORT" -ForegroundColor Green
+          if ($env:PROXY_AUTH_ENABLED -eq 'true') {
+              Write-Host "  HTTP/S:  $env:TAILSCALE_IP`:$env:PROXY_HTTP_PORT" -ForegroundColor Green
+          }
           Write-Host "  Username: $env:PROXY_USERNAME" -ForegroundColor Green
           Write-Host "  Password: $env:PROXY_PASSWORD" -ForegroundColor Green
           
           Write-Host "`n📋 Usage Examples:" -ForegroundColor Yellow
           Write-Host "  • curl --proxy socks5h://$env:PROXY_USERNAME:$env:PROXY_PASSWORD@$env:TAILSCALE_IP`:$env:PROXY_SOCKS_PORT https://api.ipify.org" -ForegroundColor White
-          Write-Host "  • curl --proxy http://$env:PROXY_USERNAME:$env:PROXY_PASSWORD@$env:TAILSCALE_IP`:$env:PROXY_HTTP_PORT https://api.ipify.org" -ForegroundColor White
+          if ($env:PROXY_AUTH_ENABLED -eq 'true') {
+              Write-Host "  • curl --proxy http://$env:PROXY_USERNAME:$env:PROXY_PASSWORD@$env:TAILSCALE_IP`:$env:PROXY_HTTP_PORT https://api.ipify.org" -ForegroundColor White
+          }
           Write-Host "  • RDP: mstsc /v:$env:TAILSCALE_IP" -ForegroundColor White
           Write-Host "==============================`n" -ForegroundColor Cyan
 
@@ -234,7 +302,13 @@ jobs:
               $proxyCheck = Get-Process -Name "3proxy" -ErrorAction SilentlyContinue
               if (-not $proxyCheck) {
                   Write-Warning "⚠️ 3proxy process not found, attempting restart..."
-                  Start-Process -FilePath "C:\3proxy\bin\3proxy.exe" -ArgumentList "--run", "C:\3proxy\3proxy.cfg" -NoNewWindow
+                  $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+                  $startInfo.FileName = "C:\3proxy\bin\3proxy.exe"
+                  $startInfo.Arguments = '"C:\3proxy\3proxy.cfg"'
+                  $startInfo.WorkingDirectory = "C:\3proxy"
+                  $startInfo.UseShellExecute = $false
+                  $startInfo.CreateNoWindow = $true
+                  [System.Diagnostics.Process]::Start($startInfo) | Out-Null
               }
               
               Start-Sleep -Seconds $heartbeatInterval
