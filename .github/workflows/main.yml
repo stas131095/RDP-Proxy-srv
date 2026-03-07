@@ -63,73 +63,76 @@ jobs:
       - name: Install and Configure 3proxy
         run: |
           $proxyDir = "C:\3proxy"
-          $logDir = "$proxyDir\logs"
           New-Item -Path $proxyDir -ItemType Directory -Force | Out-Null
-          New-Item -Path $logDir -ItemType Directory -Force | Out-Null
 
-          # Download 3proxy
           $proxyUrl = "https://github.com/z3APA3A/3proxy/releases/download/0.9.4/3proxy-0.9.4.zip"
           $zipPath = "$env:TEMP\3proxy.zip"
           Invoke-WebRequest -Uri $proxyUrl -OutFile $zipPath
           Expand-Archive -Path $zipPath -DestinationPath "$proxyDir\src" -Force
           Remove-Item $zipPath -Force
           
-          # Copy binaries
           New-Item -Path "$proxyDir\bin" -ItemType Directory -Force | Out-Null
           Copy-Item "$proxyDir\src\bin\*.*" -Destination "$proxyDir\bin\" -Force
 
-          # Generate credentials
           $proxyUser = "proxyuser"
           $proxyPass = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 12 | ForEach-Object {[char]$_})
 
-          # Create config file (using plaintext auth for reliability)
+          Write-Host "Proxy credentials:"
+          Write-Host "  Username: $proxyUser"
+          Write-Host "  Password: $proxyPass"
+
+          # Конфиг без daemon (для Windows) и с упрощённым ACL
           $cfgPath = "$proxyDir\3proxy.cfg"
           $configLines = @(
-              "daemon",
-              "log $logDir\3proxy.log D",
               "nserver 8.8.8.8",
               "nserver 8.8.4.4",
               "nscache 65536",
               "timeouts 1 5 30 60 180 1800 15 60",
               "socks -p1080",
               "auth strong",
-              "users $proxyUser:CL:$proxyPass",
+              "users " + $proxyUser + ":CL:" + $proxyPass,
               "proxy -p3128",
               "auth strong",
-              "users $proxyUser:CL:$proxyPass",
-              "allow * $proxyUser *",
+              "users " + $proxyUser + ":CL:" + $proxyPass,
+              "allow *",
               "deny * * *"
           )
 
-          # Write with ASCII encoding (critical for 3proxy)
           $configLines | Set-Content -Path $cfgPath -Encoding ASCII
           
-          Write-Host "Config file created:"
+          Write-Host "`nConfig file created:"
           Get-Content $cfgPath
 
-          # Start 3proxy
+          # Запуск в фоне через Start-Process
           $proc = Start-Process -FilePath "$proxyDir\bin\3proxy.exe" -ArgumentList $cfgPath -PassThru -NoNewWindow
-          Write-Host "3proxy started with PID: $($proc.Id)"
+          Write-Host "`n3proxy started with PID: $($proc.Id)"
 
-          # Wait and verify
           Start-Sleep -Seconds 5
           
           $socksReady = $false
           for ($i = 0; $i -lt 6; $i++) {
-              $socksReady = (Get-NetTCPConnection -LocalPort 1080 -ErrorAction SilentlyContinue) -ne $null
-              if ($socksReady) {
+              $conn = Get-NetTCPConnection -LocalPort 1080 -ErrorAction SilentlyContinue
+              if ($conn) {
+                  $socksReady = $true
                   Write-Host "SOCKS port 1080 is listening"
                   break
               }
               Write-Host "Waiting for port 1080... attempt $($i + 1)"
+              
+              # Проверка, жив ли процесс
+              $procCheck = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+              if (-not $procCheck) {
+                  Write-Host "3proxy process died!"
+                  break
+              }
+              
               Start-Sleep -Seconds 2
           }
 
           if (-not $socksReady) {
-              Write-Host "3proxy process status:"
+              Write-Host "`n3proxy process status:"
               Get-Process -Id $proc.Id -ErrorAction SilentlyContinue | Format-List *
-              Write-Host "Log file content:"
-              if (Test-Path "$logDir\3proxy.log") { Get-Content "$logDir\3proxy.log" -Tail 20 }
+              Write-Host "`nStderr/Output may be in console above"
               Write-Error "SOCKS proxy port 1080 not listening"
               exit 1
           }
@@ -139,7 +142,7 @@ jobs:
           echo "PROXY_SOCKS_PORT=1080" >> $env:GITHUB_ENV
           echo "PROXY_HTTP_PORT=3128" >> $env:GITHUB_ENV
           echo "PROXY_AUTH_ENABLED=true" >> $env:GITHUB_ENV
-          Write-Host "3proxy started successfully"
+          Write-Host "`n3proxy started successfully"
 
       - name: Verify RDP and Proxy Accessibility
         run: |
