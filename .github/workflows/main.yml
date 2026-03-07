@@ -79,7 +79,7 @@ jobs:
 
           Write-Host "Proxy credentials: User=$proxyUser Pass=$proxyPass"
 
-          # Use string formatting instead of concatenation (fixes line splitting)
+          # Use string formatting - binds to ALL interfaces (0.0.0.0)
           $usersLine = "users {0}:CL:{1}" -f $proxyUser, $proxyPass
           
           $cfgPath = "$proxyDir\3proxy.cfg"
@@ -88,10 +88,10 @@ jobs:
               "nserver 8.8.4.4",
               "nscache 65536",
               "timeouts 1 5 30 60 180 1800 15 60",
-              "socks -p1080",
+              "socks -p1080 -i0.0.0.0",
               "auth strong",
               $usersLine,
-              "proxy -p3128",
+              "proxy -p3128 -i0.0.0.0",
               "auth strong",
               $usersLine,
               "allow *",
@@ -113,7 +113,7 @@ jobs:
               $conn = Get-NetTCPConnection -LocalPort 1080 -ErrorAction SilentlyContinue
               if ($conn) {
                   $socksReady = $true
-                  Write-Host "SOCKS port 1080 is listening"
+                  Write-Host "SOCKS port 1080 is listening on $($conn.LocalAddress)"
                   break
               }
               $procCheck = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
@@ -130,12 +130,51 @@ jobs:
               exit 1
           }
 
+          # Show listening addresses
+          Write-Host "Listening connections:"
+          Get-NetTCPConnection -LocalPort 1080,3128 | Select-Object LocalAddress, LocalPort, State
+
           echo "PROXY_USERNAME=$proxyUser" >> $env:GITHUB_ENV
           echo "PROXY_PASSWORD=$proxyPass" >> $env:GITHUB_ENV
           echo "PROXY_SOCKS_PORT=1080" >> $env:GITHUB_ENV
           echo "PROXY_HTTP_PORT=3128" >> $env:GITHUB_ENV
           echo "PROXY_AUTH_ENABLED=true" >> $env:GITHUB_ENV
           Write-Host "3proxy started successfully"
+
+      - name: Verify RDP and Proxy Accessibility
+        run: |
+          Write-Host "Testing connectivity via Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Show current listening state
+          Write-Host "Current listening state:"
+          Get-NetTCPConnection -LocalPort 1080,3128,3389 | Select-Object LocalAddress, LocalPort, State, OwningProcess
+          
+          # Test RDP
+          $rdpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if (-not $rdpTest.TcpTestSucceeded) { Write-Error "RDP port 3389 unreachable"; exit 1 }
+          Write-Host "RDP: OK"
+          
+          # Test SOCKS proxy with explicit timeout
+          Write-Host "Testing SOCKS proxy..."
+          $socksTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 1080 -WarningAction SilentlyContinue -TcpTestTimeOut 5000
+          if (-not $socksTest.TcpTestSucceeded) {
+              Write-Host "SOCKS test failed. Checking firewall..."
+              netsh advfirewall firewall show rule name="Proxy-SOCKS-Tailscale"
+              Write-Error "SOCKS proxy port 1080 unreachable"
+              exit 1
+          }
+          Write-Host "SOCKS5 Proxy: OK"
+          
+          # Test HTTP proxy
+          Write-Host "Testing HTTP proxy..."
+          $httpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3128 -WarningAction SilentlyContinue -TcpTestTimeOut 5000
+          if (-not $httpTest.TcpTestSucceeded) {
+              Write-Host "HTTP test failed. Checking firewall..."
+              netsh advfirewall firewall show rule name="Proxy-HTTP-Tailscale"
+              Write-Error "HTTP proxy port 3128 unreachable"
+              exit 1
+          }
+          Write-Host "HTTP Proxy: OK"
 
       - name: Verify RDP and Proxy Accessibility
         run: |
