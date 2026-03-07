@@ -1,0 +1,159 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" -ErrorAction SilentlyContinue
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Passphrase Password
+        run: |
+          # Word list for passphrase generation (common, safe, Windows-compatible words)
+          $wordList = @(
+              'Apple', 'River', 'Mountain', 'Forest', 'Ocean', 'Sky', 'Cloud', 'Storm',
+              'Thunder', 'Lightning', 'Sunshine', 'Moonlight', 'Starlight', 'Crystal',
+              'Diamond', 'Silver', 'Golden', 'Copper', 'Iron', 'Steel', 'Phoenix',
+              'Dragon', 'Eagle', 'Wolf', 'Tiger', 'Bear', 'Falcon', 'Hawk', 'Raven',
+              'Maple', 'Cedar', 'Pine', 'Birch', 'Willow', 'Aspen', 'Cherry', 'Blossom',
+              'Meadow', 'Valley', 'Canyon', 'Summit', 'Horizon', 'Sunrise', 'Sunset',
+              'Midnight', 'Noon', 'Dawn', 'Dusk', 'Spring', 'Summer', 'Autumn', 'Winter',
+              'Happy', 'Swift', 'Brave', 'Calm', 'Bright', 'Sharp', 'Smooth', 'Quick',
+              'Noble', 'Wise', 'Kind', 'Bold', 'Fierce', 'Gentle', 'Strong', 'Pure'
+          )
+
+          # Separator and complexity options
+          $separator = '-'  # Can be '-', '.', '_', or '' for no separator
+          $useNumbers = $true
+          $useSpecial = $true
+
+          # Generate base passphrase: 4 random words
+          $passphraseWords = Get-Random -InputObject $wordList -Count 4
+          $basePass = $passphraseWords -join $separator
+
+          # Add complexity: number and special character if required
+          $suffix = ''
+          if ($useNumbers) {
+              $suffix += Get-Random -Minimum 10 -Maximum 99
+          }
+          if ($useSpecial) {
+              $specialChars = [char[]]('!', '@', '#', '$', '%', '&')
+              $suffix += Get-Random -InputObject $specialChars
+          }
+
+          $password = $basePass + $suffix
+
+          # Ensure password meets Windows complexity (min 8 chars, mixed case, digit, special)
+          if ($password.Length -lt 12) {
+              $password += Get-Random -Minimum 100 -Maximum 999
+          }
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # Remove existing user if present to avoid conflicts
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          }
+
+          # Create user and assign to groups
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -FullName "RDP Access User" -Description "Auto-generated RDP user for GitHub Actions"
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          # Output credentials securely to GitHub environment
+          echo "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          # Verify user creation
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              Write-Error "❌ Failed to create user 'RDP'"
+              exit 1
+          }
+
+          Write-Host "✅ User 'RDP' created successfully with passphrase-style password"
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "✅ TCP connectivity successful!"
+
+      - name: Output RDP Connection Details
+        run: |
+          Write-Host "`n=== 🖥️ RDP ACCESS DETAILS ===" -ForegroundColor Cyan
+          Write-Host "Address:  $env:TAILSCALE_IP" -ForegroundColor Green
+          Write-Host "Username: RDP" -ForegroundColor Green
+          Write-Host "Password: $env:RDP_PASSWORD" -ForegroundColor Green
+          Write-Host "=============================`n" -ForegroundColor Cyan
+          
+          # Note: Password is also available in GitHub environment variables for downstream steps
+          Write-Host "💡 Tip: Use these credentials in your RDP client (mstsc.exe, Royal TS, etc.)"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "⏳ Keeping runner active for RDP session..."
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          $heartbeatInterval = 300  # seconds
+          while ($true) {
+              $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              Write-Host "[$timestamp] ❤️ RDP session active — Tailscale IP: $env:TAILSCALE_IP"
+              Start-Sleep -Seconds $heartbeatInterval
+          }
