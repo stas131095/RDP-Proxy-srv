@@ -77,11 +77,11 @@ jobs:
           $proxyUser = "proxyuser"
           $proxyPass = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 12 | ForEach-Object {[char]$_})
 
-          Write-Host "Proxy credentials:"
-          Write-Host "  Username: $proxyUser"
-          Write-Host "  Password: $proxyPass"
+          Write-Host "Proxy credentials: User=$proxyUser Pass=$proxyPass"
 
-          # Конфиг без daemon (для Windows) и с упрощённым ACL
+          # Use string formatting instead of concatenation (fixes line splitting)
+          $usersLine = "users {0}:CL:{1}" -f $proxyUser, $proxyPass
+          
           $cfgPath = "$proxyDir\3proxy.cfg"
           $configLines = @(
               "nserver 8.8.8.8",
@@ -90,22 +90,21 @@ jobs:
               "timeouts 1 5 30 60 180 1800 15 60",
               "socks -p1080",
               "auth strong",
-              "users " + $proxyUser + ":CL:" + $proxyPass,
+              $usersLine,
               "proxy -p3128",
               "auth strong",
-              "users " + $proxyUser + ":CL:" + $proxyPass,
+              $usersLine,
               "allow *",
               "deny * * *"
           )
 
           $configLines | Set-Content -Path $cfgPath -Encoding ASCII
           
-          Write-Host "`nConfig file created:"
+          Write-Host "Config file created:"
           Get-Content $cfgPath
 
-          # Запуск в фоне через Start-Process
           $proc = Start-Process -FilePath "$proxyDir\bin\3proxy.exe" -ArgumentList $cfgPath -PassThru -NoNewWindow
-          Write-Host "`n3proxy started with PID: $($proc.Id)"
+          Write-Host "3proxy started with PID: $($proc.Id)"
 
           Start-Sleep -Seconds 5
           
@@ -117,22 +116,16 @@ jobs:
                   Write-Host "SOCKS port 1080 is listening"
                   break
               }
-              Write-Host "Waiting for port 1080... attempt $($i + 1)"
-              
-              # Проверка, жив ли процесс
               $procCheck = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
               if (-not $procCheck) {
                   Write-Host "3proxy process died!"
                   break
               }
-              
+              Write-Host "Waiting for port 1080... attempt $($i + 1)"
               Start-Sleep -Seconds 2
           }
 
           if (-not $socksReady) {
-              Write-Host "`n3proxy process status:"
-              Get-Process -Id $proc.Id -ErrorAction SilentlyContinue | Format-List *
-              Write-Host "`nStderr/Output may be in console above"
               Write-Error "SOCKS proxy port 1080 not listening"
               exit 1
           }
@@ -142,7 +135,7 @@ jobs:
           echo "PROXY_SOCKS_PORT=1080" >> $env:GITHUB_ENV
           echo "PROXY_HTTP_PORT=3128" >> $env:GITHUB_ENV
           echo "PROXY_AUTH_ENABLED=true" >> $env:GITHUB_ENV
-          Write-Host "`n3proxy started successfully"
+          Write-Host "3proxy started successfully"
 
       - name: Verify RDP and Proxy Accessibility
         run: |
