@@ -11,12 +11,9 @@ jobs:
     steps:
       - name: Configure Core RDP Settings
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
 
           netsh advfirewall firewall delete rule name="RDP-Tailscale" -ErrorAction SilentlyContinue
           netsh advfirewall firewall delete rule name="Proxy-HTTP-Tailscale" -ErrorAction SilentlyContinue
@@ -30,44 +27,17 @@ jobs:
 
       - name: Create RDP User with Passphrase Password
         run: |
-          $wordList = @(
-              'Apple', 'River', 'Mountain', 'Forest', 'Ocean', 'Sky', 'Cloud', 'Storm',
-              'Thunder', 'Lightning', 'Sunshine', 'Moonlight', 'Starlight', 'Crystal',
-              'Diamond', 'Silver', 'Golden', 'Copper', 'Iron', 'Steel', 'Phoenix',
-              'Dragon', 'Eagle', 'Wolf', 'Tiger', 'Bear', 'Falcon', 'Hawk', 'Raven',
-              'Maple', 'Cedar', 'Pine', 'Birch', 'Willow', 'Aspen', 'Cherry', 'Blossom',
-              'Meadow', 'Valley', 'Canyon', 'Summit', 'Horizon', 'Sunrise', 'Sunset',
-              'Midnight', 'Noon', 'Dawn', 'Dusk', 'Spring', 'Summer', 'Autumn', 'Winter',
-              'Happy', 'Swift', 'Brave', 'Calm', 'Bright', 'Sharp', 'Smooth', 'Quick',
-              'Noble', 'Wise', 'Kind', 'Bold', 'Fierce', 'Gentle', 'Strong', 'Pure'
-          )
-          $separator = '-'
-          $useNumbers = $true
-          $useSpecial = $true
+          $wordList = @('Apple','River','Mountain','Forest','Ocean','Sky','Cloud','Storm','Thunder','Lightning','Sunshine','Moonlight','Starlight','Crystal','Diamond','Silver','Golden','Copper','Iron','Steel','Phoenix','Dragon','Eagle','Wolf','Tiger','Bear','Falcon','Hawk','Raven','Maple','Cedar','Pine','Birch','Willow','Aspen','Cherry','Blossom','Meadow','Valley','Canyon','Summit','Horizon','Sunrise','Sunset','Midnight','Noon','Dawn','Dusk','Spring','Summer','Autumn','Winter','Happy','Swift','Brave','Calm','Bright','Sharp','Smooth','Quick','Noble','Wise','Kind','Bold','Fierce','Gentle','Strong','Pure')
           $passphraseWords = Get-Random -InputObject $wordList -Count 4
-          $basePass = $passphraseWords -join $separator
-          $suffix = ''
-          if ($useNumbers) { $suffix += Get-Random -Minimum 10 -Maximum 99 }
-          if ($useSpecial) {
-              $specialChars = [char[]]('!', '@', '#', '$', '%', '&')
-              $suffix += Get-Random -InputObject $specialChars
-          }
-          $password = $basePass + $suffix
-          if ($password.Length -lt 12) { $password += Get-Random -Minimum 100 -Maximum 999 }
+          $password = ($passphraseWords -join '-') + (Get-Random -Minimum 10 -Maximum 99) + (Get-Random -InputObject ('!','@','#','$','%','&'))
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-              Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
-          }
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -FullName "RDP Access User" -Description "Auto-generated RDP user for GitHub Actions"
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) { Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue }
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           echo "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-              Write-Error "Failed to create user 'RDP'"
-              exit 1
-          }
-          Write-Host "User 'RDP' created successfully"
+          Write-Host "User RDP created"
 
       - name: Install Tailscale
         run: |
@@ -87,91 +57,108 @@ jobs:
               Start-Sleep -Seconds 5
               $retries++
           }
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
       - name: Install and Configure 3proxy
         run: |
           $proxyDir = "C:\3proxy"
-          New-Item -Path $proxyDir -ItemType Directory -Force | Out-Null
           $logDir = "$proxyDir\logs"
+          New-Item -Path $proxyDir -ItemType Directory -Force | Out-Null
           New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+
           $proxyUrl = "https://github.com/z3APA3A/3proxy/releases/download/0.9.4/3proxy-0.9.4.zip"
           $zipPath = "$env:TEMP\3proxy.zip"
           Invoke-WebRequest -Uri $proxyUrl -OutFile $zipPath
           Expand-Archive -Path $zipPath -DestinationPath "$proxyDir\src" -Force
           Remove-Item $zipPath -Force
+          
           New-Item -Path "$proxyDir\bin" -ItemType Directory -Force | Out-Null
           Copy-Item "$proxyDir\src\bin\*.*" -Destination "$proxyDir\bin\" -Force
+
           $proxyUser = "proxyuser"
           $proxyPass = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 12 | ForEach-Object {[char]$_})
-          $hashOutput = & "$proxyDir\bin\3proxy.exe" "--hash=$proxyPass" 2>&1 | Out-String
-          $authHash = ($hashOutput -split ":")[1].Trim()
+          
+          $hashOutput = & "$proxyDir\bin\3proxy.exe" "--hash=$proxyPass" 2>&1
+          $authHash = ""
+          foreach ($line in $hashOutput) {
+              if ($line -match ":") {
+                  $authHash = ($line -split ":", 2)[1].Trim()
+                  break
+              }
+          }
+          
           $usePlaintext = $false
           if (-not $authHash) {
-              Write-Warning "Could not generate hash, falling back to plaintext auth"
+              Write-Warning "Hash generation failed, using plaintext auth"
               $usePlaintext = $true
           }
-          $cfg = "$proxyDir\3proxy.cfg"
-          $lines = @()
-          $lines += "daemon"
-          $lines += "log `"$logDir\3proxy.log`" D"
-          $lines += "nserver 8.8.8.8"
-          $lines += "nserver 8.8.4.4"
-          $lines += "nscache 65536"
-          $lines += "timeouts 1 5 30 60 180 1800 15 60"
-          $lines += "socks -p1080"
+
+          # Write config file line by line to avoid encoding issues
+          $cfgPath = "$proxyDir\3proxy.cfg"
+          $configLines = @(
+              "daemon",
+              "log $logDir\3proxy.log D",
+              "nserver 8.8.8.8",
+              "nserver 8.8.4.4",
+              "nscache 65536",
+              "timeouts 1 5 30 60 180 1800 15 60",
+              "socks -p1080"
+          )
+          
           if ($usePlaintext) {
-              $lines += "auth none"
-              $lines += "allow * * *"
+              $configLines += "auth none"
+              $configLines += "allow * * *"
           } else {
-              $lines += "auth strong"
-              $lines += "users $proxyUser`:CL`:$authHash"
-              $lines += "proxy -p3128"
-              $lines += "auth strong"
-              $lines += "users $proxyUser`:CL`:$authHash"
-              $lines += "allow * $proxyUser *"
-              $lines += "deny * * *"
+              $configLines += "auth strong"
+              $configLines += "users $proxyUser:CL:$authHash"
+              $configLines += "proxy -p3128"
+              $configLines += "auth strong"
+              $configLines += "users $proxyUser:CL:$authHash"
+              $configLines += "allow * $proxyUser *"
+              $configLines += "deny * * *"
           }
-          [System.IO.File]::WriteAllLines($cfg, $lines, [System.Text.Encoding]::Default)
-          $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-          $startInfo.FileName = "$proxyDir\bin\3proxy.exe"
-          $startInfo.Arguments = "`"$cfg`""
-          $startInfo.WorkingDirectory = $proxyDir
-          $startInfo.UseShellExecute = $false
-          $startInfo.CreateNoWindow = $true
-          $proc = [System.Diagnostics.Process]::Start($startInfo)
+
+          # Write with ASCII encoding (3proxy requirement)
+          $configLines | Set-Content -Path $cfgPath -Encoding ASCII
+          
+          Write-Host "Config file created:"
+          Get-Content $cfgPath
+
+          # Start 3proxy
+          $proc = Start-Process -FilePath "$proxyDir\bin\3proxy.exe" -ArgumentList $cfgPath -PassThru -NoNewWindow
           Write-Host "3proxy started with PID: $($proc.Id)"
+
+          # Wait and verify
           Start-Sleep -Seconds 5
-          $maxRetries = 6
-          $retryCount = 0
-          $socksReady = $false
-          $httpReady = $false
-          while ($retryCount -lt $maxRetries) {
+          
+          for ($i = 0; $i -lt 6; $i++) {
               $socksReady = (Get-NetTCPConnection -LocalPort 1080 -ErrorAction SilentlyContinue) -ne $null
-              $httpReady = (Get-NetTCPConnection -LocalPort 3128 -ErrorAction SilentlyContinue) -ne $null
-              if ($socksReady -and ($usePlaintext -or $httpReady)) { break }
+              if ($socksReady) {
+                  Write-Host "SOCKS port 1080 is listening"
+                  break
+              }
+              Write-Host "Waiting for port 1080... attempt $($i + 1)"
               Start-Sleep -Seconds 2
-              $retryCount++
           }
+
           if (-not $socksReady) {
+              Write-Host "3proxy process status:"
+              Get-Process -Id $proc.Id -ErrorAction SilentlyContinue | Format-List *
+              Write-Host "Config file content:"
+              Get-Content $cfgPath
+              Write-Host "Log file content:"
+              if (Test-Path "$logDir\3proxy.log") { Get-Content "$logDir\3proxy.log" -Tail 20 }
               Write-Error "SOCKS proxy port 1080 not listening"
-              if (Test-Path "$logDir\3proxy.log") { Get-Content "$logDir\3proxy.log" -Tail 10 -ErrorAction SilentlyContinue }
               exit 1
           }
-          if (-not $usePlaintext -and -not $httpReady) {
-              Write-Error "HTTP proxy port 3128 not listening"
-              exit 1
-          }
+
           echo "PROXY_USERNAME=$proxyUser" >> $env:GITHUB_ENV
           echo "PROXY_PASSWORD=$proxyPass" >> $env:GITHUB_ENV
           echo "PROXY_SOCKS_PORT=1080" >> $env:GITHUB_ENV
           echo "PROXY_HTTP_PORT=3128" >> $env:GITHUB_ENV
           echo "PROXY_AUTH_ENABLED=$(!$usePlaintext)" >> $env:GITHUB_ENV
-          Write-Host "3proxy started successfully (SOCKS5:1080, HTTP:3128)"
+          Write-Host "3proxy started successfully"
 
       - name: Verify RDP and Proxy Accessibility
         run: |
@@ -186,8 +173,6 @@ jobs:
               $httpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3128 -WarningAction SilentlyContinue
               if (-not $httpTest.TcpTestSucceeded) { Write-Error "HTTP proxy port 3128 unreachable"; exit 1 }
               Write-Host "HTTP Proxy: OK"
-          } else {
-              Write-Host "HTTP proxy skipped (plaintext auth mode)"
           }
 
       - name: Output Connection Details
@@ -198,37 +183,17 @@ jobs:
           Write-Host "  Username: RDP"
           Write-Host "  Password: $env:RDP_PASSWORD"
           Write-Host "`nProxy Credentials:"
-          Write-Host "  SOCKS5:  $env:TAILSCALE_IP`:$env:PROXY_SOCKS_PORT"
-          if ($env:PROXY_AUTH_ENABLED -eq 'true') {
-              Write-Host "  HTTP/S:  $env:TAILSCALE_IP`:$env:PROXY_HTTP_PORT"
-          }
+          Write-Host "  SOCKS5: $env:TAILSCALE_IP:$env:PROXY_SOCKS_PORT"
           Write-Host "  Username: $env:PROXY_USERNAME"
           Write-Host "  Password: $env:PROXY_PASSWORD"
-          Write-Host "`nUsage Examples:"
-          Write-Host "  curl --proxy socks5h://$env:PROXY_USERNAME:$env:PROXY_PASSWORD@$env:TAILSCALE_IP`:$env:PROXY_SOCKS_PORT https://api.ipify.org"
-          if ($env:PROXY_AUTH_ENABLED -eq 'true') {
-              Write-Host "  curl --proxy http://$env:PROXY_USERNAME:$env:PROXY_PASSWORD@$env:TAILSCALE_IP`:$env:PROXY_HTTP_PORT https://api.ipify.org"
-          }
+          Write-Host "`nUsage:"
+          Write-Host "  curl --proxy socks5h://$env:PROXY_USERNAME:$env:PROXY_PASSWORD@$env:TAILSCALE_IP:$env:PROXY_SOCKS_PORT https://api.ipify.org"
           Write-Host "  RDP: mstsc /v:$env:TAILSCALE_IP"
-          Write-Host "==============================`n"
 
       - name: Maintain Connection
         run: |
-          Write-Host "Keeping runner active for RDP/Proxy session..."
-          $heartbeatInterval = 300
+          Write-Host "Keeping runner active..."
           while ($true) {
-              $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-              Write-Host "[$timestamp] Session active — IP: $env:TAILSCALE_IP"
-              $proxyCheck = Get-Process -Name "3proxy" -ErrorAction SilentlyContinue
-              if (-not $proxyCheck) {
-                  Write-Warning "3proxy process not found, attempting restart..."
-                  $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-                  $startInfo.FileName = "C:\3proxy\bin\3proxy.exe"
-                  $startInfo.Arguments = '"C:\3proxy\3proxy.cfg"'
-                  $startInfo.WorkingDirectory = "C:\3proxy"
-                  $startInfo.UseShellExecute = $false
-                  $startInfo.CreateNoWindow = $true
-                  [System.Diagnostics.Process]::Start($startInfo) | Out-Null
-              }
-              Start-Sleep -Seconds $heartbeatInterval
+              Write-Host "[$(Get-Date)] Session active — IP: $env:TAILSCALE_IP"
+              Start-Sleep -Seconds 300
           }
