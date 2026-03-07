@@ -1,0 +1,241 @@
+name: RDP + Proxy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp-proxy:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Clean up existing firewall rules
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" -ErrorAction SilentlyContinue
+          netsh advfirewall firewall delete rule name="Proxy-HTTP-Tailscale" -ErrorAction SilentlyContinue
+          netsh advfirewall firewall delete rule name="Proxy-SOCKS-Tailscale" -ErrorAction SilentlyContinue
+          
+          # Allow RDP
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          # Allow HTTP Proxy (3128) and SOCKS5 (1080)
+          netsh advfirewall firewall add rule name="Proxy-HTTP-Tailscale" dir=in action=allow protocol=TCP localport=3128
+          netsh advfirewall firewall add rule name="Proxy-SOCKS-Tailscale" dir=in action=allow protocol=TCP localport=1080
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Passphrase Password
+        run: |
+          $wordList = @(
+              'Apple', 'River', 'Mountain', 'Forest', 'Ocean', 'Sky', 'Cloud', 'Storm',
+              'Thunder', 'Lightning', 'Sunshine', 'Moonlight', 'Starlight', 'Crystal',
+              'Diamond', 'Silver', 'Golden', 'Copper', 'Iron', 'Steel', 'Phoenix',
+              'Dragon', 'Eagle', 'Wolf', 'Tiger', 'Bear', 'Falcon', 'Hawk', 'Raven',
+              'Maple', 'Cedar', 'Pine', 'Birch', 'Willow', 'Aspen', 'Cherry', 'Blossom',
+              'Meadow', 'Valley', 'Canyon', 'Summit', 'Horizon', 'Sunrise', 'Sunset',
+              'Midnight', 'Noon', 'Dawn', 'Dusk', 'Spring', 'Summer', 'Autumn', 'Winter',
+              'Happy', 'Swift', 'Brave', 'Calm', 'Bright', 'Sharp', 'Smooth', 'Quick',
+              'Noble', 'Wise', 'Kind', 'Bold', 'Fierce', 'Gentle', 'Strong', 'Pure'
+          )
+
+          $separator = '-'
+          $useNumbers = $true
+          $useSpecial = $true
+
+          $passphraseWords = Get-Random -InputObject $wordList -Count 4
+          $basePass = $passphraseWords -join $separator
+
+          $suffix = ''
+          if ($useNumbers) { $suffix += Get-Random -Minimum 10 -Maximum 99 }
+          if ($useSpecial) {
+              $specialChars = [char[]]('!', '@', '#', '$', '%', '&')
+              $suffix += Get-Random -InputObject $specialChars
+          }
+
+          $password = $basePass + $suffix
+          if ($password.Length -lt 12) { $password += Get-Random -Minimum 100 -Maximum 999 }
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          }
+
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -FullName "RDP Access User" -Description "Auto-generated RDP user for GitHub Actions"
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          echo "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              Write-Error "❌ Failed to create user 'RDP'"
+              exit 1
+          }
+          Write-Host "✅ User 'RDP' created successfully"
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Install and Configure 3proxy
+        run: |
+          # Create proxy directory
+          $proxyDir = "C:\3proxy"
+          New-Item -Path $proxyDir -ItemType Directory -Force | Out-Null
+
+          # Download 3proxy (latest stable Windows build)
+          $proxyUrl = "https://github.com/z3APA3A/3proxy/releases/download/0.9.4/3proxy-0.9.4.zip"
+          $zipPath = "$env:TEMP\3proxy.zip"
+          Invoke-WebRequest -Uri $proxyUrl -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath $proxyDir -Force
+          Remove-Item $zipPath -Force
+
+          # Generate proxy auth credentials (optional, comment out to disable auth)
+          $proxyUser = "proxyuser"
+          $proxyPass = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 12 | ForEach-Object {[char]$_})
+          $authHash = & "$proxyDir\bin\3proxy.exe" --hash=$proxyPass
+          
+          # Create 3proxy configuration file
+          $config = @"
+          daemon
+          nserver 8.8.8.8
+          nserver 8.8.4.4
+          nscache 65536
+          timeouts 1 5 30 60 180 1800 15 60
+          setgid 0
+          setuid 0
+
+          # SOCKS5 proxy on port 1080
+          socks -p1080
+          auth strong
+          users $proxyUser:CL:$authHash
+
+          # HTTP/HTTPS proxy on port 3128
+          proxy -p3128
+          auth strong
+          users $proxyUser:CL:$authHash
+
+          allow * $proxyUser *
+          deny * * *
+          "@
+          $config | Out-File -FilePath "$proxyDir\3proxy.cfg" -Encoding ASCII
+
+          # Start 3proxy as a background process
+          Start-Process -FilePath "$proxyDir\bin\3proxy.exe" -ArgumentList "--run", "$proxyDir\3proxy.cfg" -NoNewWindow -PassThru
+
+          # Save proxy credentials to environment
+          echo "PROXY_USERNAME=$proxyUser" >> $env:GITHUB_ENV
+          echo "PROXY_PASSWORD=$proxyPass" >> $env:GITHUB_ENV
+          echo "PROXY_SOCKS_PORT=1080" >> $env:GITHUB_ENV
+          echo "PROXY_HTTP_PORT=3128" >> $env:GITHUB_ENV
+
+          # Verify proxy is listening
+          Start-Sleep -Seconds 3
+          $socksListener = Get-NetTCPConnection -LocalPort 1080 -ErrorAction SilentlyContinue
+          $httpListener = Get-NetTCPConnection -LocalPort 3128 -ErrorAction SilentlyContinue
+          
+          if (-not $socksListener -or -not $httpListener) {
+              Write-Error "❌ Proxy failed to start on expected ports"
+              exit 1
+          }
+          Write-Host "✅ 3proxy started successfully (SOCKS5:1080, HTTP:3128)"
+
+      - name: Verify RDP and Proxy Accessibility
+        run: |
+          Write-Host "🔍 Testing connectivity via Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test RDP
+          $rdpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if (-not $rdpTest.TcpTestSucceeded) {
+              Write-Error "❌ RDP port 3389 unreachable"
+              exit 1
+          }
+          Write-Host "✅ RDP: OK"
+
+          # Test SOCKS proxy
+          $socksTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 1080 -WarningAction SilentlyContinue
+          if (-not $socksTest.TcpTestSucceeded) {
+              Write-Error "❌ SOCKS proxy port 1080 unreachable"
+              exit 1
+          }
+          Write-Host "✅ SOCKS5 Proxy: OK"
+
+          # Test HTTP proxy
+          $httpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3128 -WarningAction SilentlyContinue
+          if (-not $httpTest.TcpTestSucceeded) {
+              Write-Error "❌ HTTP proxy port 3128 unreachable"
+              exit 1
+          }
+          Write-Host "✅ HTTP Proxy: OK"
+
+      - name: Output Connection Details
+        run: |
+          Write-Host "`n=== 🖥️ RDP + 🌐 PROXY ACCESS ===" -ForegroundColor Cyan
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP" -ForegroundColor Green
+          
+          Write-Host "`n🔐 RDP Credentials:" -ForegroundColor Yellow
+          Write-Host "  Username: RDP" -ForegroundColor Green
+          Write-Host "  Password: $env:RDP_PASSWORD" -ForegroundColor Green
+          
+          Write-Host "`n🌐 Proxy Credentials:" -ForegroundColor Yellow
+          Write-Host "  SOCKS5:  $env:TAILSCALE_IP`:$env:PROXY_SOCKS_PORT" -ForegroundColor Green
+          Write-Host "  HTTP/S:  $env:TAILSCALE_IP`:$env:PROXY_HTTP_PORT" -ForegroundColor Green
+          Write-Host "  Username: $env:PROXY_USERNAME" -ForegroundColor Green
+          Write-Host "  Password: $env:PROXY_PASSWORD" -ForegroundColor Green
+          
+          Write-Host "`n📋 Usage Examples:" -ForegroundColor Yellow
+          Write-Host "  • curl --proxy socks5h://$env:PROXY_USERNAME:$env:PROXY_PASSWORD@$env:TAILSCALE_IP`:$env:PROXY_SOCKS_PORT https://api.ipify.org" -ForegroundColor White
+          Write-Host "  • curl --proxy http://$env:PROXY_USERNAME:$env:PROXY_PASSWORD@$env:TAILSCALE_IP`:$env:PROXY_HTTP_PORT https://api.ipify.org" -ForegroundColor White
+          Write-Host "  • RDP: mstsc /v:$env:TAILSCALE_IP" -ForegroundColor White
+          Write-Host "==============================`n" -ForegroundColor Cyan
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "⏳ Keeping runner active for RDP/Proxy session..."
+          
+          $heartbeatInterval = 300
+          while ($true) {
+              $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              Write-Host "[$timestamp] ❤️ Session active — IP: $env:TAILSCALE_IP"
+              
+              # Optional: health check for proxy
+              $proxyCheck = Get-Process -Name "3proxy" -ErrorAction SilentlyContinue
+              if (-not $proxyCheck) {
+                  Write-Warning "⚠️ 3proxy process not found, attempting restart..."
+                  Start-Process -FilePath "C:\3proxy\bin\3proxy.exe" -ArgumentList "--run", "C:\3proxy\3proxy.cfg" -NoNewWindow
+              }
+              
+              Start-Sleep -Seconds $heartbeatInterval
+          }
