@@ -9,19 +9,24 @@ jobs:
     timeout-minutes: 3600
 
     steps:
+      # ============================================
+      # ЭТАП 1: Настройка RDP (полностью первым)
+      # ============================================
       - name: Configure Core RDP Settings
         run: |
+          # Включаем RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
 
+          # Очищаем старые правила фаервола
           netsh advfirewall firewall delete rule name="RDP-Tailscale" -ErrorAction SilentlyContinue
           netsh advfirewall firewall delete rule name="Proxy-HTTP-Tailscale" -ErrorAction SilentlyContinue
           netsh advfirewall firewall delete rule name="Proxy-SOCKS-Tailscale" -ErrorAction SilentlyContinue
           
+          # Добавляем новые правила (только RDP на этом этапе)
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-          netsh advfirewall firewall add rule name="Proxy-HTTP-Tailscale" dir=in action=allow protocol=TCP localport=3128
-          netsh advfirewall firewall add rule name="Proxy-SOCKS-Tailscale" dir=in action=allow protocol=TCP localport=1080
+          # Правила для прокси добавим позже, в скрипте прокси
 
           Restart-Service -Name TermService -Force
 
@@ -31,10 +36,12 @@ jobs:
           $passphraseWords = Get-Random -InputObject $wordList -Count 4
           $password = ($passphraseWords -join '-') + (Get-Random -Minimum 10 -Maximum 99) + (Get-Random -InputObject ('!','@','#','$','%','&'))
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) { Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue }
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
           echo "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           Write-Host "User RDP created"
@@ -60,11 +67,26 @@ jobs:
           if (-not $tsIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Install and Configure 3proxy as Service
+      # ============================================
+      # ЭТАП 2: Настройка прокси через скрипт в C:/Users/Public
+      # ============================================
+      - name: Create Proxy Setup Script in C:/Users/Public
         run: |
+          $publicDir = "C:/Users/Public"
+          if (!(Test-Path $publicDir)) { New-Item -Path $publicDir -ItemType Directory -Force | Out-Null }
+          
+          $scriptPath = "$publicDir/setup-proxy.ps1"
+          
+          $scriptContent = @'
+          param(
+              [string]$ProxyUser,
+              [string]$ProxyPass
+          )
+
           $proxyDir = "C:\3proxy"
           New-Item -Path $proxyDir -ItemType Directory -Force | Out-Null
 
+          # Скачиваем и распаковываем 3proxy
           $proxyUrl = "https://github.com/z3APA3A/3proxy/releases/download/0.9.4/3proxy-0.9.4.zip"
           $zipPath = "$env:TEMP\3proxy.zip"
           Invoke-WebRequest -Uri $proxyUrl -OutFile $zipPath
@@ -74,13 +96,8 @@ jobs:
           New-Item -Path "$proxyDir\bin" -ItemType Directory -Force | Out-Null
           Copy-Item "$proxyDir\src\bin\*.*" -Destination "$proxyDir\bin\" -Force
 
-          $proxyUser = "proxyuser"
-          $proxyPass = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 12 | ForEach-Object {[char]$_})
-
-          Write-Host "Proxy credentials: User=$proxyUser Pass=$proxyPass"
-
-          # Create config file
-          $usersLine = "users {0}:CL:{1}" -f $proxyUser, $proxyPass
+          # Создаём конфиг
+          $usersLine = "users {0}:CL:{1}" -f $ProxyUser, $ProxyPass
           $cfgPath = "$proxyDir\3proxy.cfg"
           $configLines = @(
               "nserver 8.8.8.8",
@@ -98,53 +115,46 @@ jobs:
           )
           $configLines | Set-Content -Path $cfgPath -Encoding ASCII
           
-          Write-Host "Config file created:"
-          Get-Content $cfgPath
-
-          # Remove existing service if present
+          # Устанавливаем как сервис
           & "$proxyDir\bin\3proxy.exe" --remove 2>$null
-
-          # Install as Windows service
-          $installResult = & "$proxyDir\bin\3proxy.exe" --install $cfgPath 2>&1
-          Write-Host "Service install result: $installResult"
-
-          # Start the service
+          & "$proxyDir\bin\3proxy.exe" --install $cfgPath
+          
+          # Запускаем сервис
           Start-Service -Name "3proxy" -ErrorAction Stop
-          Write-Host "3proxy service started"
-
-          # Wait for service to be fully running
           Start-Sleep -Seconds 5
 
-          # Verify service is running
-          $service = Get-Service -Name "3proxy"
-          Write-Host "Service status: $($service.Status)"
+          # Открываем порты в фаерволе для прокси
+          netsh advfirewall firewall add rule name="Proxy-HTTP-Tailscale" dir=in action=allow protocol=TCP localport=3128
+          netsh advfirewall firewall add rule name="Proxy-SOCKS-Tailscale" dir=in action=allow protocol=TCP localport=1080
 
-          # Verify ports are listening
-          Write-Host "Checking listening ports..."
-          $socksPort = Get-NetTCPConnection -LocalPort 1080 -ErrorAction SilentlyContinue
-          $httpPort = Get-NetTCPConnection -LocalPort 3128 -ErrorAction SilentlyContinue
+          Write-Host "3proxy service installed and started"
+          '@
+
+          # Записываем скрипт в файл с UTF8-кодировкой (важно для PowerShell)
+          $scriptContent | Out-File -FilePath $scriptPath -Encoding utf8
+          Write-Host "Proxy setup script created at: $scriptPath"
+
+      - name: Generate Proxy Credentials and Run Setup Script
+        run: |
+          $publicDir = "C:/Users/Public"
+          $proxyUser = "proxyuser"
+          $proxyPass = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 12 | ForEach-Object {[char]$_})
           
-          if ($socksPort) {
-              Write-Host "SOCKS port 1080 is listening on $($socksPort.LocalAddress)"
-          } else {
-              Write-Error "SOCKS port 1080 not listening"
-              exit 1
-          }
-
-          if ($httpPort) {
-              Write-Host "HTTP port 3128 is listening on $($httpPort.LocalAddress)"
-          } else {
-              Write-Error "HTTP port 3128 not listening"
-              exit 1
-          }
-
+          Write-Host "Proxy credentials: User=$proxyUser Pass=$proxyPass"
+          
+          # Запускаем вынесенный скрипт с параметрами
+          & "$publicDir/setup-proxy.ps1" -ProxyUser $proxyUser -ProxyPass $proxyPass
+          
+          # Сохраняем переменные для следующих шагов
           echo "PROXY_USERNAME=$proxyUser" >> $env:GITHUB_ENV
           echo "PROXY_PASSWORD=$proxyPass" >> $env:GITHUB_ENV
           echo "PROXY_SOCKS_PORT=1080" >> $env:GITHUB_ENV
           echo "PROXY_HTTP_PORT=3128" >> $env:GITHUB_ENV
           echo "PROXY_AUTH_ENABLED=true" >> $env:GITHUB_ENV
-          Write-Host "3proxy service running successfully"
 
+      # ============================================
+      # ЭТАП 3: Верификация и вывод данных
+      # ============================================
       - name: Verify RDP and Proxy Accessibility
         run: |
           Write-Host "Testing connectivity via Tailscale IP: $env:TAILSCALE_IP"
