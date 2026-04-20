@@ -10,7 +10,7 @@ jobs:
 
     steps:
       # ============================================
-      # ЭТАП 1: Настройка RDP (полностью первым)
+      # ЭТАП 1: Базовая настройка системы
       # ============================================
       - name: Configure Core RDP Settings
         run: |
@@ -24,9 +24,8 @@ jobs:
           netsh advfirewall firewall delete rule name="Proxy-HTTP-Tailscale" -ErrorAction SilentlyContinue
           netsh advfirewall firewall delete rule name="Proxy-SOCKS-Tailscale" -ErrorAction SilentlyContinue
           
-          # Добавляем новые правила (только RDP на этом этапе)
+          # Правило только для RDP (прокси добавим в самом конце)
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-          # Правила для прокси добавим позже, в скрипте прокси
 
           Restart-Service -Name TermService -Force
 
@@ -68,7 +67,17 @@ jobs:
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
       # ============================================
-      # ЭТАП 2: Настройка прокси через скрипт в C:/Users/Public
+      # ЭТАП 2: Проверка базовой связности (только RDP)
+      # ============================================
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Testing RDP connectivity via Tailscale IP: $env:TAILSCALE_IP"
+          $rdpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue -TcpTestTimeOut 5000
+          if (-not $rdpTest.TcpTestSucceeded) { Write-Error "RDP port 3389 unreachable"; exit 1 }
+          Write-Host "✓ RDP is accessible"
+
+      # ============================================
+      # ЭТАП 3: Подготовка скрипта прокси (в C:/Users/Public)
       # ============================================
       - name: Create Proxy Setup Script in C:/Users/Public
         run: |
@@ -130,11 +139,13 @@ jobs:
           Write-Host "3proxy service installed and started"
           '@
 
-          # Записываем скрипт в файл с UTF8-кодировкой (важно для PowerShell)
           $scriptContent | Out-File -FilePath $scriptPath -Encoding utf8
           Write-Host "Proxy setup script created at: $scriptPath"
 
-      - name: Generate Proxy Credentials and Run Setup Script
+      # ============================================
+      # ЭТАП 4: Запуск прокси (самый последний шаг перед Maintain)
+      # ============================================
+      - name: Generate Credentials and Start Proxy Service
         run: |
           $publicDir = "C:/Users/Public"
           $proxyUser = "proxyuser"
@@ -145,54 +156,46 @@ jobs:
           # Запускаем вынесенный скрипт с параметрами
           & "$publicDir/setup-proxy.ps1" -ProxyUser $proxyUser -ProxyPass $proxyPass
           
-          # Сохраняем переменные для следующих шагов
+          # Сохраняем переменные
           echo "PROXY_USERNAME=$proxyUser" >> $env:GITHUB_ENV
           echo "PROXY_PASSWORD=$proxyPass" >> $env:GITHUB_ENV
           echo "PROXY_SOCKS_PORT=1080" >> $env:GITHUB_ENV
           echo "PROXY_HTTP_PORT=3128" >> $env:GITHUB_ENV
           echo "PROXY_AUTH_ENABLED=true" >> $env:GITHUB_ENV
+          
+          Write-Host "✓ Proxy service started"
 
-      # ============================================
-      # ЭТАП 3: Верификация и вывод данных
-      # ============================================
-      - name: Verify RDP and Proxy Accessibility
+      - name: Verify Proxy Accessibility
         run: |
-          Write-Host "Testing connectivity via Tailscale IP: $env:TAILSCALE_IP"
-          
-          Write-Host "Service status:"
-          Get-Service -Name "3proxy" | Select-Object Name, Status, StartType
-          
-          Write-Host "Listening ports:"
-          Get-NetTCPConnection -LocalPort 1080,3128,3389 -ErrorAction SilentlyContinue | Select-Object LocalAddress, LocalPort, State
-          
-          $rdpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue -TcpTestTimeOut 5000
-          if (-not $rdpTest.TcpTestSucceeded) { Write-Error "RDP port 3389 unreachable"; exit 1 }
-          Write-Host "RDP: OK"
+          Write-Host "Testing proxy connectivity via Tailscale IP: $env:TAILSCALE_IP"
           
           $socksTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 1080 -WarningAction SilentlyContinue -TcpTestTimeOut 5000
           if (-not $socksTest.TcpTestSucceeded) { Write-Error "SOCKS proxy port 1080 unreachable"; exit 1 }
-          Write-Host "SOCKS5 Proxy: OK"
+          Write-Host "✓ SOCKS5 Proxy: OK"
           
           $httpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3128 -WarningAction SilentlyContinue -TcpTestTimeOut 5000
           if (-not $httpTest.TcpTestSucceeded) { Write-Error "HTTP proxy port 3128 unreachable"; exit 1 }
-          Write-Host "HTTP Proxy: OK"
+          Write-Host "✓ HTTP Proxy: OK"
 
-      - name: Output Connection Details
+      # ============================================
+      # ЭТАП 5: Финальный вывод и поддержка сессии
+      # ============================================
+      - name: Output Full Connection Details
         run: |
           Write-Host "`n=== RDP + PROXY ACCESS ==="
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "`nRDP Credentials:"
-          Write-Host "  Username: RDP"
-          Write-Host "  Password: $env:RDP_PASSWORD"
-          Write-Host "`nProxy Credentials:"
-          Write-Host "  SOCKS5: $env:TAILSCALE_IP:$env:PROXY_SOCKS_PORT"
-          Write-Host "  HTTP/S: $env:TAILSCALE_IP:$env:PROXY_HTTP_PORT"
-          Write-Host "  Username: $env:PROXY_USERNAME"
-          Write-Host "  Password: $env:PROXY_PASSWORD"
-          Write-Host "`nUsage:"
-          Write-Host "  curl --proxy socks5h://$env:PROXY_USERNAME:$env:PROXY_PASSWORD@$env:TAILSCALE_IP:$env:PROXY_SOCKS_PORT https://api.ipify.org"
-          Write-Host "  curl --proxy http://$env:PROXY_USERNAME:$env:PROXY_PASSWORD@$env:TAILSCALE_IP:$env:PROXY_HTTP_PORT https://api.ipify.org"
-          Write-Host "  RDP: mstsc /v:$env:TAILSCALE_IP"
+          Write-Host "`n🔹 RDP Credentials:"
+          Write-Host "   Username: RDP"
+          Write-Host "   Password: $env:RDP_PASSWORD"
+          Write-Host "`n🔹 Proxy Credentials:"
+          Write-Host "   SOCKS5: $env:TAILSCALE_IP:$env:PROXY_SOCKS_PORT"
+          Write-Host "   HTTP/S: $env:TAILSCALE_IP:$env:PROXY_HTTP_PORT"
+          Write-Host "   Username: $env:PROXY_USERNAME"
+          Write-Host "   Password: $env:PROXY_PASSWORD"
+          Write-Host "`n📋 Usage examples:"
+          Write-Host "   curl --proxy socks5h://$env:PROXY_USERNAME:$env:PROXY_PASSWORD@$env:TAILSCALE_IP:$env:PROXY_SOCKS_PORT https://api.ipify.org"
+          Write-Host "   curl --proxy http://$env:PROXY_USERNAME:$env:PROXY_PASSWORD@$env:TAILSCALE_IP:$env:PROXY_HTTP_PORT https://api.ipify.org"
+          Write-Host "   RDP: mstsc /v:$env:TAILSCALE_IP"
 
       - name: Maintain Connection
         run: |
