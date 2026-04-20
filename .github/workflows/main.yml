@@ -71,10 +71,15 @@ jobs:
       # ============================================
       - name: Verify RDP Accessibility
         run: |
-          Write-Host "Testing RDP connectivity via Tailscale IP: $env:TAILSCALE_IP"
-          $rdpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue -TcpTestTimeOut 5000
-          if (-not $rdpTest.TcpTestSucceeded) { Write-Error "RDP port 3389 unreachable"; exit 1 }
-          Write-Host "✓ RDP is accessible"
+        Write-Host "Testing RDP connectivity via Tailscale IP: $env:TAILSCALE_IP"
+    
+      # Test RDP port
+       $rdpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+       if (-not $rdpTest.TcpTestSucceeded) { 
+        Write-Error "RDP port 3389 unreachable"
+        exit 1 
+        }
+     Write-Host "RDP: OK"
 
       # ============================================
       # ЭТАП 3: Подготовка скрипта прокси (в C:/Users/Public)
