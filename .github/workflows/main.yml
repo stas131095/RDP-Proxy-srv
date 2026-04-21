@@ -126,7 +126,6 @@ jobs:
           param([string]`$ProxyUser, [string]`$ProxyPass)
           & C:\3proxy\bin\3proxy.exe --install C:\3proxy\3proxy.cfg
           Start-Service -Name "3proxy"
-"@
           $scriptContent | Out-File -FilePath "$publicDir/setup-proxy.ps1" -Encoding utf8
           
           # Удаляем старый сервис если есть
