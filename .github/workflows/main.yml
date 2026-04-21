@@ -6,29 +6,23 @@ on:
 jobs:
   secure-rdp-proxy:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 30
 
     steps:
-      # ============================================
-      # ЭТАП 1: Настройка RDP (полностью первым)
-      # ============================================
       - name: Configure Core RDP Settings
         run: |
-          # Включаем RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
 
-          # Очищаем старые правила фаервола
           netsh advfirewall firewall delete rule name="RDP-Tailscale" -ErrorAction SilentlyContinue
           netsh advfirewall firewall delete rule name="Proxy-HTTP-Tailscale" -ErrorAction SilentlyContinue
           netsh advfirewall firewall delete rule name="Proxy-SOCKS-Tailscale" -ErrorAction SilentlyContinue
           
-          # Добавляем новые правила (только RDP на этом этапе)
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-          # Правила для прокси добавим позже, в скрипте прокси
 
           Restart-Service -Name TermService -Force
+          Write-Host "RDP configured successfully"
 
       - name: Create RDP User with Passphrase Password
         run: |
@@ -53,6 +47,7 @@ jobs:
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
+          Write-Host "Tailscale installed"
 
       - name: Establish Tailscale Connection
         run: |
@@ -66,38 +61,43 @@ jobs:
           }
           if (-not $tsIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $tsIP"
 
-      # ============================================
-      # ЭТАП 2: Настройка прокси через скрипт в C:/Users/Public
-      # ============================================
-      - name: Create Proxy Setup Script in C:/Users/Public
+      - name: Install and Configure 3proxy Directly
         run: |
-          $publicDir = "C:/Users/Public"
-          if (!(Test-Path $publicDir)) { New-Item -Path $publicDir -ItemType Directory -Force | Out-Null }
+          Write-Host "Starting 3proxy installation..."
           
-          $scriptPath = "$publicDir/setup-proxy.ps1"
-          
-          $scriptContent = @'
-          param(
-              [string]$ProxyUser,
-              [string]$ProxyPass
-          )
-
           $proxyDir = "C:\3proxy"
           New-Item -Path $proxyDir -ItemType Directory -Force | Out-Null
 
-          # Скачиваем и распаковываем 3proxy
+          # Скачиваем 3proxy с таймаутом
+          Write-Host "Downloading 3proxy..."
           $proxyUrl = "https://github.com/z3APA3A/3proxy/releases/download/0.9.4/3proxy-0.9.4.zip"
           $zipPath = "$env:TEMP\3proxy.zip"
-          Invoke-WebRequest -Uri $proxyUrl -OutFile $zipPath
+          
+          try {
+              Invoke-WebRequest -Uri $proxyUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 30
+              Write-Host "Download completed"
+          } catch {
+              Write-Error "Failed to download 3proxy: $_"
+              exit 1
+          }
+          
+          Write-Host "Extracting 3proxy..."
           Expand-Archive -Path $zipPath -DestinationPath "$proxyDir\src" -Force
           Remove-Item $zipPath -Force
           
           New-Item -Path "$proxyDir\bin" -ItemType Directory -Force | Out-Null
           Copy-Item "$proxyDir\src\bin\*.*" -Destination "$proxyDir\bin\" -Force
-
-          # Создаём конфиг
-          $usersLine = "users {0}:CL:{1}" -f $ProxyUser, $ProxyPass
+          
+          # Генерируем учетные данные
+          $proxyUser = "proxyuser"
+          $proxyPass = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 12 | ForEach-Object {[char]$_})
+          
+          Write-Host "Proxy credentials: User=$proxyUser Pass=$proxyPass"
+          
+          # Создаем конфиг
+          $usersLine = "users {0}:CL:{1}" -f $proxyUser, $proxyPass
           $cfgPath = "$proxyDir\3proxy.cfg"
           $configLines = @(
               "nserver 8.8.8.8",
@@ -115,97 +115,131 @@ jobs:
           )
           $configLines | Set-Content -Path $cfgPath -Encoding ASCII
           
-          # Устанавливаем как сервис
+          Write-Host "Config created at $cfgPath"
+          Get-Content $cfgPath
+          
+          # Создаем скрипт в C:/Users/Public для будущего использования
+          $publicDir = "C:/Users/Public"
+          if (!(Test-Path $publicDir)) { New-Item -Path $publicDir -ItemType Directory -Force | Out-Null }
+          
+          $scriptContent = @"
+          param([string]`$ProxyUser, [string]`$ProxyPass)
+          & C:\3proxy\bin\3proxy.exe --install C:\3proxy\3proxy.cfg
+          Start-Service -Name "3proxy"
+"@
+          $scriptContent | Out-File -FilePath "$publicDir/setup-proxy.ps1" -Encoding utf8
+          
+          # Удаляем старый сервис если есть
+          Write-Host "Removing old service if exists..."
           & "$proxyDir\bin\3proxy.exe" --remove 2>$null
-          & "$proxyDir\bin\3proxy.exe" --install $cfgPath
+          Start-Sleep -Seconds 2
+          
+          # Устанавливаем сервис
+          Write-Host "Installing 3proxy service..."
+          $installOutput = & "$proxyDir\bin\3proxy.exe" --install $cfgPath 2>&1
+          Write-Host "Install output: $installOutput"
           
           # Запускаем сервис
-          Start-Service -Name "3proxy" -ErrorAction Stop
-          Start-Sleep -Seconds 5
-
-          # Открываем порты в фаерволе для прокси
+          Write-Host "Starting 3proxy service..."
+          try {
+              Start-Service -Name "3proxy" -ErrorAction Stop
+              Start-Sleep -Seconds 3
+          } catch {
+              Write-Error "Failed to start 3proxy service: $_"
+              Get-Service -Name "3proxy" -ErrorAction SilentlyContinue | Select-Object Name, Status
+              exit 1
+          }
+          
+          # Проверяем статус
+          $service = Get-Service -Name "3proxy"
+          Write-Host "Service status: $($service.Status)"
+          
+          if ($service.Status -ne 'Running') {
+              Write-Error "3proxy service is not running!"
+              exit 1
+          }
+          
+          # Открываем порты в фаерволе
           netsh advfirewall firewall add rule name="Proxy-HTTP-Tailscale" dir=in action=allow protocol=TCP localport=3128
           netsh advfirewall firewall add rule name="Proxy-SOCKS-Tailscale" dir=in action=allow protocol=TCP localport=1080
-
-          Write-Host "3proxy service installed and started"
-          '@
-
-          # Записываем скрипт в файл с UTF8-кодировкой (важно для PowerShell)
-          $scriptContent | Out-File -FilePath $scriptPath -Encoding utf8
-          Write-Host "Proxy setup script created at: $scriptPath"
-
-      - name: Generate Proxy Credentials and Run Setup Script
-        run: |
-          $publicDir = "C:/Users/Public"
-          $proxyUser = "proxyuser"
-          $proxyPass = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 12 | ForEach-Object {[char]$_})
           
-          Write-Host "Proxy credentials: User=$proxyUser Pass=$proxyPass"
+          # Проверяем порты
+          Write-Host "Checking listening ports..."
+          $socksPort = Get-NetTCPConnection -LocalPort 1080 -ErrorAction SilentlyContinue
+          $httpPort = Get-NetTCPConnection -LocalPort 3128 -ErrorAction SilentlyContinue
           
-          # Запускаем вынесенный скрипт с параметрами
-          & "$publicDir/setup-proxy.ps1" -ProxyUser $proxyUser -ProxyPass $proxyPass
+          if ($socksPort) { Write-Host "SOCKS port 1080: OK" }
+          else { Write-Error "SOCKS port 1080 not listening"; exit 1 }
           
-          # Сохраняем переменные для следующих шагов
+          if ($httpPort) { Write-Host "HTTP port 3128: OK" }
+          else { Write-Error "HTTP port 3128 not listening"; exit 1 }
+          
+          # Сохраняем переменные
           echo "PROXY_USERNAME=$proxyUser" >> $env:GITHUB_ENV
           echo "PROXY_PASSWORD=$proxyPass" >> $env:GITHUB_ENV
           echo "PROXY_SOCKS_PORT=1080" >> $env:GITHUB_ENV
           echo "PROXY_HTTP_PORT=3128" >> $env:GITHUB_ENV
-          echo "PROXY_AUTH_ENABLED=true" >> $env:GITHUB_ENV
+          
+          Write-Host "3proxy setup completed successfully!"
 
-      # ============================================
-      # ЭТАП 3: Верификация и вывод данных
-      # ============================================
       - name: Verify RDP and Proxy Accessibility
         run: |
           Write-Host "Testing connectivity via Tailscale IP: $env:TAILSCALE_IP"
           
-          Write-Host "Service status:"
+          Write-Host "`nService status:"
           Get-Service -Name "3proxy" | Select-Object Name, Status, StartType
           
-          Write-Host "Listening ports:"
+          Write-Host "`nListening ports:"
           Get-NetTCPConnection -LocalPort 1080,3128,3389 -ErrorAction SilentlyContinue | Select-Object LocalAddress, LocalPort, State
           
-          # Test RDP port (исправлено - убран несуществующий параметр TcpTestTimeOut)
+          Write-Host "`nTesting RDP (3389)..."
           $rdpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-          if (-not $rdpTest.TcpTestSucceeded) { Write-Error "RDP port 3389 unreachable"; exit 1 }
-          Write-Host "RDP: OK"
+          if ($rdpTest.TcpTestSucceeded) { Write-Host "✓ RDP: OK" }
+          else { Write-Error "✗ RDP port 3389 unreachable"; exit 1 }
           
-          # Test SOCKS proxy port
+          Write-Host "Testing SOCKS5 (1080)..."
           $socksTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 1080 -WarningAction SilentlyContinue
-          if (-not $socksTest.TcpTestSucceeded) { Write-Error "SOCKS proxy port 1080 unreachable"; exit 1 }
-          Write-Host "SOCKS5 Proxy: OK"
+          if ($socksTest.TcpTestSucceeded) { Write-Host "✓ SOCKS5 Proxy: OK" }
+          else { Write-Error "✗ SOCKS proxy port 1080 unreachable"; exit 1 }
           
-          # Test HTTP proxy port
+          Write-Host "Testing HTTP (3128)..."
           $httpTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3128 -WarningAction SilentlyContinue
-          if (-not $httpTest.TcpTestSucceeded) { Write-Error "HTTP proxy port 3128 unreachable"; exit 1 }
-          Write-Host "HTTP Proxy: OK"
+          if ($httpTest.TcpTestSucceeded) { Write-Host "✓ HTTP Proxy: OK" }
+          else { Write-Error "✗ HTTP proxy port 3128 unreachable"; exit 1 }
+          
+          Write-Host "`nAll tests passed!"
 
       - name: Output Connection Details
         run: |
-          Write-Host "`n=== RDP + PROXY ACCESS ==="
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "`nRDP Credentials:"
+          Write-Host "`n========================================"
+          Write-Host "   RDP + PROXY ACCESS INFORMATION"
+          Write-Host "========================================`n"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP`n"
+          Write-Host "RDP Credentials:"
           Write-Host "  Username: RDP"
-          Write-Host "  Password: $env:RDP_PASSWORD"
-          Write-Host "`nProxy Credentials:"
+          Write-Host "  Password: $env:RDP_PASSWORD`n"
+          Write-Host "Proxy Credentials:"
           Write-Host "  SOCKS5: $env:TAILSCALE_IP:$env:PROXY_SOCKS_PORT"
           Write-Host "  HTTP/S: $env:TAILSCALE_IP:$env:PROXY_HTTP_PORT"
           Write-Host "  Username: $env:PROXY_USERNAME"
-          Write-Host "  Password: $env:PROXY_PASSWORD"
-          Write-Host "`nUsage:"
+          Write-Host "  Password: $env:PROXY_PASSWORD`n"
+          Write-Host "Usage examples:"
           Write-Host "  curl --proxy socks5h://$env:PROXY_USERNAME:$env:PROXY_PASSWORD@$env:TAILSCALE_IP:$env:PROXY_SOCKS_PORT https://api.ipify.org"
           Write-Host "  curl --proxy http://$env:PROXY_USERNAME:$env:PROXY_PASSWORD@$env:TAILSCALE_IP:$env:PROXY_HTTP_PORT https://api.ipify.org"
-          Write-Host "  RDP: mstsc /v:$env:TAILSCALE_IP"
+          Write-Host "  RDP: mstsc /v:$env:TAILSCALE_IP`n"
+          Write-Host "========================================"
 
-      - name: Maintain Connection
+      - name: Keep-Alive (Optional - 5 minutes max)
         run: |
-          Write-Host "Keeping runner active..."
-          while ($true) {
+          Write-Host "Keeping session active for 5 minutes..."
+          $endTime = (Get-Date).AddMinutes(5)
+          while ((Get-Date) -lt $endTime) {
               $service = Get-Service -Name "3proxy" -ErrorAction SilentlyContinue
               if ($service -and $service.Status -ne 'Running') {
-                  Write-Warning "3proxy service not running, restarting..."
-                  Start-Service -Name "3proxy"
+                  Write-Warning "3proxy not running, restarting..."
+                  Start-Service -Name "3proxy" -ErrorAction SilentlyContinue
               }
-              Write-Host "[$(Get-Date)] Session active — IP: $env:TAILSCALE_IP"
-              Start-Sleep -Seconds 300
+              Write-Host "[$(Get-Date)] Active — IP: $env:TAILSCALE_IP"
+              Start-Sleep -Seconds 60
           }
+          Write-Host "Keep-alive period ended"
